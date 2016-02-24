@@ -1,7 +1,43 @@
 from buildbot.status.base import StatusReceiverMultiService
-from buildbot.status.builder import Results, SUCCESS
-import requests
+from buildbot.status.builder import SUCCESS, WARNINGS, FAILURE, EXCEPTION
+from buildbot.status.builder import SKIPPED, RETRY
+from twisted.web.http_headers import Headers
+from twisted.web.iweb import IBodyProducer
+from twisted.internet import defer, reactor
+from twisted.web.client import Agent
+from zope.interface import implements
+from twisted.python import log
 import json
+
+
+def _statusToText(status):
+    mapping = {
+        SUCCESS: "SUCCESS",
+        WARNINGS: "WARNINGS",
+        FAILURE: "FAILURE",
+        EXCEPTION: "EXCEPTION",
+        SKIPPED: "SKIPPED",
+        RETRY: "RETRY",
+    }
+    return mapping[status]
+
+
+class StringProducer(object):
+    implements(IBodyProducer)
+
+    def __init__(self, body):
+        self.body = body
+        self.length = len(body)
+
+    def startProducing(self, consumer):
+        consumer.write(self.body)
+        return defer.succeed(None)
+
+    def pauseProducing(self):
+        pass
+
+    def stopProducing(self):
+        pass
 
 
 class SlackStatusPush(StatusReceiverMultiService):
@@ -13,7 +49,7 @@ class SlackStatusPush(StatusReceiverMultiService):
     def __init__(self, weburl,
                  localhost_replace=False, username=None,
                  icon=None, notify_on_success=True, notify_on_failure=True,
-                 **kwargs):
+                 builder_filter=None, **kwargs):
         """
         Creates a SlackStatusPush status service.
 
@@ -28,6 +64,8 @@ class SlackStatusPush(StatusReceiverMultiService):
             messages when a build was successful.
         :param notify_on_failure: Set this to False if you don't want
             messages when a build failed.
+        :param builder_filter: Set the list of builders you want Slack
+            notifications to be sent. If not set, all builders get notified.
         """
 
         StatusReceiverMultiService.__init__(self)
@@ -38,6 +76,7 @@ class SlackStatusPush(StatusReceiverMultiService):
         self.icon = icon
         self.notify_on_success = notify_on_success
         self.notify_on_failure = notify_on_failure
+        self.builder_filter = builder_filter
         self.watched = []
 
     def setServiceParent(self, parent):
@@ -57,70 +96,120 @@ class SlackStatusPush(StatusReceiverMultiService):
         self.watched.append(builder)
         return self  # subscribe to this builder
 
-    def buildFinished(self, builder_name, build, result):
-        if not self.notify_on_success and result == SUCCESS:
-            return
+    def getMessageSubject(self, builder_name, build, result):
+        if result == FAILURE:
+            title = "The Buildbot has detected a failed build"
+        elif result == WARNINGS:
+            title = "The Buildbot has detected a problem in the build"
+        elif result == SUCCESS:
+            title = "The Buildbot has detected a passing build"
+        elif result == EXCEPTION:
+            title = "The Buildbot has detected a build exception"
 
-        if not self.notify_on_failure and result != SUCCESS:
-            return
+        projects = [ss.project for ss in build.getSourceStamps() if ss.project]
 
-        build_url = self.master_status.getURLForThing(build)
-        if self.localhost_replace:
-            build_url = build_url.replace("//localhost", "//{}".format(
-                self.localhost_replace))
+        if not projects:
+            projects = [self.master_status.getTitle()]
 
-        source_stamps = build.getSourceStamps()
-        branch_names = ', '.join([source_stamp.branch for source_stamp in source_stamps])
-        repositories = ', '.join([source_stamp.repository for source_stamp in source_stamps])
-        responsible_users = ', '.join(build.getResponsibleUsers())
-        revision = ', '.join([source_stamp.revision for source_stamp in source_stamps])
-        project = ', '.join([source_stamp.project for source_stamp in source_stamps])
-
-        if result == SUCCESS:
-            status = "Success"
-            color = "good"
-        else:
-            status = "Failure"
-            color = "failure"
-
-        message = "New Build for {project} ({revision})\nStatus: *{status}*\nBuild details: {url}".format(
-            project=project,
-            revision=revision,
-            status=status,
-            url=build_url
+        title += " on builder {builder} for project {project}".format(
+            builder=builder_name,
+            project=', '.join(projects),
         )
+        return title
 
+    def getRevisionDetails(self, build):
         fields = []
-        if responsible_users:
+        for ss in build.getSourceStamps():
+            if ss.repository:
+                fields.append({
+                    "title": "Repository",
+                    "value": ss.repository,
+                })
+            if ss.revision:
+                fields.append({
+                    "title": "Revision",
+                    "value": ss.revision,
+                    "short": True
+                })
+            if ss.branch:
+                fields.append({
+                    "title": "Branch",
+                    "value": ss.branch,
+                    "short": True
+                })
+
+        fields.append({
+            "title": "Blamelist",
+            "value": ", ".join([ru for ru in build.getResponsibleUsers()])
+        })
+        return fields
+
+    def tweakUrl(self, url):
+        if self.localhost_replace:
+            url = url.replace("//localhost", "//{}".format(
+                self.localhost_replace))
+        return url
+
+    def getBuildAndProjectUrls(self, build):
+        fields = []
+        url = self.master_status.getURLForThing(build)
+
+        if url:
             fields.append({
-                "title": "Commiters",
-                "value": responsible_users
+                "title": "Build details",
+                "value": self.tweakUrl(url)
             })
 
-        if repositories:
+        url = self.master_status.getBuildbotURL()
+        if url:
             fields.append({
-                "title": "Repository",
-                "value": repositories,
-                "short": True
+                "title": "Buildbot URL",
+                "value": self.tweakUrl(url)
             })
+        return fields
 
-        if branch_names:
-            fields.append({
-                "title": "Branch",
-                "value": branch_names,
+    def getMessageColor(self, result):
+        if result in (SUCCESS, RETRY):
+            color = "good"
+        elif result == WARNINGS:
+            color = "warning"
+        else:
+            color = "danger"
+        return color
+
+    def buildMessagePayload(self, builder_name, build, result):
+        message = self.getMessageSubject(builder_name, build, result)
+
+        fields = [
+            {
+                "title": "Status",
+                "value": _statusToText(result),
                 "short": True
-            })
+            },
+            {
+                "title": "Buildslave",
+                "value": build.getSlavename(),
+                "short": True
+            },
+            {
+                "title": "Build Reason",
+                "value": build.getReason(),
+            },
+        ]
+
+        fields.extend(self.getRevisionDetails(build))
+        fields.extend(self.getBuildAndProjectUrls(build))
 
         payload = {
             "text": " ",
             "attachments": [
-              {
-                "fallback": message,
-                "text": message,
-                "color": color,
-                "mrkdwn_in": ["text", "title", "fallback"],
-                "fields": fields
-              }
+                {
+                    "fallback": message,
+                    "text": message,
+                    "color": self.getMessageColor(result),
+                    "mrkdwn_in": ["text", "title", "fallback"],
+                    "fields": fields
+                }
             ]
         }
 
@@ -132,5 +221,46 @@ class SlackStatusPush(StatusReceiverMultiService):
                 payload['icon_emoji'] = self.icon
             else:
                 payload['icon_url'] = self.icon
+        return payload
 
-        requests.post(self.weburl, data=json.dumps(payload))
+    def checkHookSuccess(self, response):
+        if response.code >= 200 or response.code < 400:
+            log.msg(
+                "[Slack status] successfully sent message"
+            )
+        else:
+            log.err(
+                "[Slack status] failed to send message: "
+                "[code=%s, err=%s]" % (
+                    response.code, response.phase)
+            )
+
+    def logHookError(self, err):
+        log.err(
+            "[Slack status] failed to send message "
+            "[err=%s]" % err.value
+        )
+
+    def buildFinished(self, builder_name, build, result):
+        if self.builder_filter and builder_name not in self.builder_filter:
+            return
+
+        if not self.notify_on_success and result == SUCCESS:
+            return
+
+        if not self.notify_on_failure and result != SUCCESS:
+            return
+
+        payload = self.buildMessagePayload(builder_name, build, result)
+
+        agent = Agent(reactor)
+        d = agent.request(
+            "POST",
+            self.weburl,
+            Headers({
+                "Content-Type": ["application/json"],
+                "User-Agent": ["Buildbot slack status plugin"],
+            }),
+            StringProducer(json.dumps(payload))
+        )
+        d.addCallbacks(self.checkHookSuccess, self.logHookError)

@@ -29,21 +29,31 @@ import slack
 c['status'].append(slack.SlackStatusPush("YOUR_SLACK_WEBURL"))
 ```
 
+## Notifications filtering
+
+You may filter which builder should send notifications by setting the
+`builder_filter`.
+
+If set, only builder which name is specified in the filter will be allowed to
+send notifications.
+
+By default, there is no filtering and any builder will notify.
+
 ### Additional Options:
 ```
   localhost_replace = False
-  builder_name = False
   username = None
   icon = None
   notify_on_success = True
   notify_on_failure = True
+  builder_filter = None
 ```
 
 ### Complete Example:
 
 ```
 import slack
-c['status'].append(slack.SlackStatusPush("YOUR_SLACK_WEBURL", "http://ci.mindmatters.de", "mindmatters Builder", None, None, False, True)
+c['status'].append(slack.SlackStatusPush("YOUR_SLACK_WEBURL", "http://ci.mindmatters.de", "mindmatters Builder", None, None, False, True, ["i386-project"])
 ```
 
 Enjoy!

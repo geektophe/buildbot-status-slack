@@ -2,8 +2,13 @@ from distutils.core import setup
 
 setup(
     name='buildbot_status_slack',
-    version='0.1.0',
-    author=['Sylvain Zimmer', 'Marten Klitzke', 'Raphael Randschau'],
+    version='0.2.0',
+    author=[
+        'Sylvain Zimmer',
+        'Marten Klitzke',
+        'Raphael Randschau',
+        'Christophe Simon'
+    ],
     packages=[],
     scripts=[],
     url='https://github.com/mindmatters/buildbot-status-slack',
@@ -13,4 +18,9 @@ setup(
     install_requires=[
         "buildbot >= 0.8.0",
     ],
+    entry_points={
+        'buildbot.status': [
+            'SlackStatusPush = slack:SlackStatusPush'
+        ]
+    }
 )
